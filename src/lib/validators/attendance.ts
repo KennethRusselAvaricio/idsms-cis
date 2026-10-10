@@ -2,8 +2,11 @@ import { z } from "zod";
 import { DeviationType, Program } from "@prisma/client";
 
 export const scheduleConfigSchema = z.object({
-  daysOfWeek: z.array(z.number().int().min(0).max(6)).min(1, "Select at least one working day"),
-  hoursPerDay: z.number().positive(),
+  daysOfWeek: z
+    .array(z.number().int().min(0).max(6))
+    .min(1, "Select at least one working day")
+    .refine((days) => new Set(days).size === days.length, "Working days must be unique"),
+  hoursPerDay: z.number().positive().max(24),
 });
 
 export const scheduleChangeRequestSchema = z.object({

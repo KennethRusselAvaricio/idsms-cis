@@ -21,6 +21,11 @@ describe("scheduleConfigSchema", () => {
   it("rejects a day outside 0-6", () => {
     expect(() => scheduleConfigSchema.parse({ daysOfWeek: [7], hoursPerDay: 8 })).toThrow();
   });
+
+  it("rejects duplicate days and more than 24 hours per day", () => {
+    expect(() => scheduleConfigSchema.parse({ daysOfWeek: [1, 1], hoursPerDay: 8 })).toThrow();
+    expect(() => scheduleConfigSchema.parse({ daysOfWeek: [1], hoursPerDay: 25 })).toThrow();
+  });
 });
 
 describe("scheduleChangeRequestSchema", () => {

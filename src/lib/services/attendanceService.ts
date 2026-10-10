@@ -8,15 +8,13 @@ import {
   Role,
   ValidationStatus,
   WeeklyReportStatus,
+  WorkPlanStatus,
 } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { assertCanAccessStudent } from "@/lib/services/userService";
+import { logEvent } from "@/lib/services/auditService";
+import { assertCanAccessStudent, ForbiddenError } from "@/lib/services/userService";
 import { getLatestApprovedWorkPlanForStudent } from "@/lib/services/workPlanService";
-
-// `logEvent` from "@/lib/services/auditService" is intentionally not
-// imported yet — no stub body below calls it (they're all placeholders).
-// Import it when implementing the real logic behind any mutation stub; an
-// unused import fails this project's ESLint no-unused-vars rule.
+import { scheduleConfigSchema } from "@/lib/validators/attendance";
 
 export interface ConfigureWorkScheduleInput {
   daysOfWeek: number[]; // 0=Sunday..6=Saturday
@@ -28,24 +26,75 @@ export interface ConfigureWorkScheduleInput {
 // schedule (daily hours, working days).
 // Connects to: called by POST /api/students/[studentProfileId]/schedule
 // (Task 9 route). Writes `WorkPlan.scheduleConfig` (Json field on the
-// `work_plans` table, prisma.workPlan.update inside a $transaction) — read
+// `work_plans` table, prisma.workPlan.updateMany inside a $transaction) — read
 // `WorkPlan.status` (WorkPlanStatus enum) first. Log via
 // `logEvent({ action: "SCHEDULE_CONFIGURED", entityType: "WorkPlan", ... })`
 // from auditService.ts.
-// Edge cases: no WorkPlan with status APPROVED exists yet for this student
-// (throw, don't silently no-op); scheduleConfig already set (decide
-// overwrite vs. reject — FR-AT-01 doesn't specify, this is a call for the
-// implementer to make and document).
+// Edge cases: the latest WorkPlan must be APPROVED, and an already configured
+// schedule cannot be overwritten here. Later changes use the reviewed
+// schedule-change flow (FR-AT-08/09).
+export class WorkScheduleConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkScheduleConfigurationError";
+  }
+}
+
 export async function configureWorkSchedule(
   studentProfileId: string,
   input: ConfigureWorkScheduleInput,
   actingUser: { id: string; role: Role },
   ipAddress?: string | null
 ): Promise<{ studentProfileId: string; scheduleConfig: ConfigureWorkScheduleInput }> {
+  if (actingUser.role !== Role.STUDENT_INTERN) {
+    throw new ForbiddenError("Only the student can configure their work schedule");
+  }
   await assertCanAccessStudent(actingUser, studentProfileId);
-  // TODO(KennethRusselAvaricio): implement per the contract above.
-  void ipAddress;
-  return { studentProfileId, scheduleConfig: input };
+  const scheduleConfig = scheduleConfigSchema.parse(input);
+
+  return prisma.$transaction(async (tx) => {
+    const latest = await tx.workPlan.findFirst({
+      where: { studentProfileId },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, status: true, scheduleConfig: true },
+    });
+
+    if (!latest || latest.status !== WorkPlanStatus.APPROVED) {
+      throw new WorkScheduleConfigurationError("The latest work plan must be approved first");
+    }
+    if (latest.scheduleConfig !== null) {
+      throw new WorkScheduleConfigurationError(
+        "The work schedule is already configured; request a schedule change instead"
+      );
+    }
+
+    // Keep the one-time setup rule atomic if two requests arrive together.
+    const updated = await tx.workPlan.updateMany({
+      where: {
+        id: latest.id,
+        status: WorkPlanStatus.APPROVED,
+        scheduleConfig: { equals: Prisma.AnyNull },
+      },
+      data: { scheduleConfig },
+    });
+    if (updated.count !== 1) {
+      throw new WorkScheduleConfigurationError(
+        "The work schedule is already configured; request a schedule change instead"
+      );
+    }
+    await logEvent(
+      {
+        userId: actingUser.id,
+        action: "SCHEDULE_CONFIGURED",
+        entityType: "WorkPlan",
+        entityId: latest.id,
+        ipAddress,
+      },
+      tx
+    );
+
+    return { studentProfileId, scheduleConfig };
+  });
 }
 
 export interface HolidayCalendarEntryDTO {

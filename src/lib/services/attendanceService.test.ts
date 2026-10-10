@@ -1,5 +1,14 @@
-import { DeviationType, Program, Role, ValidationStatus, WeeklyReportStatus } from "@prisma/client";
+import {
+  DeviationType,
+  Prisma,
+  Program,
+  Role,
+  ValidationStatus,
+  WeeklyReportStatus,
+  WorkPlanStatus,
+} from "@prisma/client";
 import { prismaMock, resetPrismaMock } from "@/testUtils/prismaMock";
+import { ForbiddenError } from "@/lib/services/userService";
 import {
   applyScheduleChangeProspectively,
   approveScheduleChangeCoordinator,
@@ -22,6 +31,7 @@ import {
   submitDeviationReport,
   validateDeviationReport,
   validateScheduleChangeFaculty,
+  WorkScheduleConfigurationError,
 } from "@/lib/services/attendanceService";
 
 const studentUser = { id: "student-1", role: Role.STUDENT_INTERN };
@@ -35,18 +45,122 @@ beforeEach(() => {
   } as never);
 });
 
+describe("configureWorkSchedule", () => {
+  const scheduleConfig = { daysOfWeek: [1, 2, 3], hoursPerDay: 8 };
+
+  it("persists a valid schedule on the latest approved work plan and logs the action", async () => {
+    prismaMock.workPlan.findFirst.mockResolvedValue({
+      id: "wp-1",
+      status: WorkPlanStatus.APPROVED,
+      scheduleConfig: null,
+    } as never);
+    prismaMock.workPlan.updateMany.mockResolvedValue({ count: 1 });
+
+    await expect(
+      configureWorkSchedule("profile-1", scheduleConfig, studentUser, "127.0.0.1")
+    ).resolves.toEqual({ studentProfileId: "profile-1", scheduleConfig });
+
+    expect(prismaMock.workPlan.findFirst).toHaveBeenCalledWith({
+      where: { studentProfileId: "profile-1" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, status: true, scheduleConfig: true },
+    });
+    expect(prismaMock.workPlan.updateMany).toHaveBeenCalledWith({
+      where: {
+        id: "wp-1",
+        status: WorkPlanStatus.APPROVED,
+        scheduleConfig: { equals: Prisma.AnyNull },
+      },
+      data: { scheduleConfig },
+    });
+    expect(prismaMock.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "student-1",
+        action: "SCHEDULE_CONFIGURED",
+        entityType: "WorkPlan",
+        entityId: "wp-1",
+        ipAddress: "127.0.0.1",
+      }),
+    });
+  });
+
+  it("rejects when there is no approved latest work plan", async () => {
+    prismaMock.workPlan.findFirst.mockResolvedValue(null);
+    await expect(configureWorkSchedule("profile-1", scheduleConfig, studentUser)).rejects.toThrow(
+      WorkScheduleConfigurationError
+    );
+
+    prismaMock.workPlan.findFirst.mockResolvedValue({
+      id: "wp-2",
+      status: WorkPlanStatus.SUBMITTED,
+      scheduleConfig: null,
+    } as never);
+    await expect(configureWorkSchedule("profile-1", scheduleConfig, studentUser)).rejects.toThrow(
+      WorkScheduleConfigurationError
+    );
+    expect(prismaMock.workPlan.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects overwriting an existing schedule", async () => {
+    prismaMock.workPlan.findFirst.mockResolvedValue({
+      id: "wp-1",
+      status: WorkPlanStatus.APPROVED,
+      scheduleConfig: { daysOfWeek: [1], hoursPerDay: 6 },
+    } as never);
+
+    await expect(configureWorkSchedule("profile-1", scheduleConfig, studentUser)).rejects.toThrow(
+      "request a schedule change"
+    );
+    expect(prismaMock.workPlan.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects a simultaneous setup that lost the one-time write", async () => {
+    prismaMock.workPlan.findFirst.mockResolvedValue({
+      id: "wp-1",
+      status: WorkPlanStatus.APPROVED,
+      scheduleConfig: null,
+    } as never);
+    prismaMock.workPlan.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(configureWorkSchedule("profile-1", scheduleConfig, studentUser)).rejects.toThrow(
+      WorkScheduleConfigurationError
+    );
+    expect(prismaMock.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { daysOfWeek: [], hoursPerDay: 8 },
+    { daysOfWeek: [7], hoursPerDay: 8 },
+    { daysOfWeek: [1, 1], hoursPerDay: 8 },
+    { daysOfWeek: [1], hoursPerDay: 0 },
+    { daysOfWeek: [1], hoursPerDay: 25 },
+  ])("rejects malformed schedule input %#", async (input) => {
+    await expect(configureWorkSchedule("profile-1", input, studentUser)).rejects.toThrow();
+    expect(prismaMock.workPlan.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.workPlan.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("rejects staff and another student before touching a work plan", async () => {
+    await expect(
+      configureWorkSchedule("profile-1", scheduleConfig, {
+        id: "faculty-1",
+        role: Role.FACULTY_ADVISER,
+      })
+    ).rejects.toThrow(ForbiddenError);
+    await expect(
+      configureWorkSchedule("profile-1", scheduleConfig, {
+        id: "student-2",
+        role: Role.STUDENT_INTERN,
+      })
+    ).rejects.toThrow(ForbiddenError);
+    expect(prismaMock.workPlan.findFirst).not.toHaveBeenCalled();
+  });
+});
+
 describe("attendanceService stubs — reachable and wired correctly", () => {
   // TODO(JayPing23): replace each of these placeholder-return assertions
   // once the real logic behind it lands (see PHASE3_TASKS.md for owners).
-  it("configureWorkSchedule resolves without throwing", async () => {
-    const result = await configureWorkSchedule(
-      "profile-1",
-      { daysOfWeek: [1, 2, 3], hoursPerDay: 8 },
-      studentUser
-    );
-    expect(result.studentProfileId).toBe("profile-1");
-  });
-
   it("getHolidayCalendarForStudent resolves an array", async () => {
     await expect(getHolidayCalendarForStudent("profile-1")).resolves.toEqual([]);
   });

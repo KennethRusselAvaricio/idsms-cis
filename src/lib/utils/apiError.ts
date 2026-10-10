@@ -10,6 +10,7 @@ import {
   InvalidScheduleChangeCoordinatorStateError,
   InvalidScheduleChangeStateError,
   MissingScheduleChangeRequestError,
+  WorkScheduleConfigurationError,
 } from "@/lib/services/attendanceService";
 
 export function handleApiError(error: unknown): NextResponse {
@@ -32,6 +33,9 @@ export function handleApiError(error: unknown): NextResponse {
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
   if (error instanceof WorkPlanPendingError) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  if (error instanceof WorkScheduleConfigurationError) {
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
   if (error instanceof InvalidScheduleChangeStateError) {
